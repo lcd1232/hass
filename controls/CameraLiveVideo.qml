@@ -25,6 +25,13 @@ Item {
     videoOutput: video
     // No audioOutput: a panel row should not start talking.
     onSourceChanged: if (source.toString().length > 0) play()
+    // Qt 6.10+: smaller buffers. Set from script so an older Qt still plays.
+    Component.onCompleted: {
+      try {
+        playbackOptions.playbackIntent = PlaybackOptions.LowLatencyStreaming
+      } catch (e) {
+      }
+    }
     onErrorOccurred: root.failed()
   }
 

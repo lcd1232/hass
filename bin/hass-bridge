@@ -78,6 +78,7 @@ Flags
 """
 
 import hashlib
+import zlib
 import http.client
 import http.server
 import json
@@ -173,6 +174,7 @@ STREAM_CHUNK = 64 * 1024
 HLS_URL = re.compile(r"/api/hls/[A-Za-z0-9_-]+/master_playlist\.m3u8")
 STREAM_PATH = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*(/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*")
 STREAM_QUERY = re.compile(r"[A-Za-z0-9_=&.-]*")
+MAX_PLAYLIST_SIZE = 1024 * 1024
 SNAPSHOT_DIR_PREFIX = "hass-snapshots-"
 SNAPSHOT_DIR = re.compile(r"hass-snapshots-(\d+)-")
 
@@ -741,6 +743,75 @@ def open_upstream(http_base, path, verify_tls, timeout, headers):
         raise
 
 
+def live_edge_playlist(text):
+    """Cut an HLS media playlist down to its newest segment.
+
+    ffmpeg starts a live stream three segments back from the end, which with
+    Home Assistant's 2 s segments is most of the delay. Renumbering the media
+    and discontinuity sequences keeps the cut playlist consistent with the
+    full ones that follow, so the player carries on from there.
+    """
+    header, blocks, block, trailer = [], [], [], []
+    carried = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if not line.startswith("#"):
+            blocks.append(block + [line])
+            block = []
+            continue
+        tag = line.split(":", 1)[0]
+        if tag in ("#EXT-X-MAP", "#EXT-X-KEY"):
+            carried[tag] = line
+        elif tag in ("#EXTINF", "#EXT-X-PROGRAM-DATE-TIME", "#EXT-X-DISCONTINUITY",
+                     "#EXT-X-BYTERANGE", "#EXT-X-GAP", "#EXT-X-PART"):
+            block.append(line)
+        elif tag == "#EXT-X-START":
+            pass
+        elif blocks:
+            trailer.append(line)
+        else:
+            header.append(line)
+    if len(blocks) < 2:
+        return None
+    dropped = blocks[:-1]
+    discontinuities = sum(1 for b in dropped for line in b
+                          if line == "#EXT-X-DISCONTINUITY")
+    out = []
+    for line in header:
+        tag, _, value = line.partition(":")
+        if tag == "#EXT-X-MEDIA-SEQUENCE" and value.isdigit():
+            line = "%s:%d" % (tag, int(value) + len(dropped))
+        elif tag == "#EXT-X-DISCONTINUITY-SEQUENCE" and value.isdigit():
+            line = "%s:%d" % (tag, int(value) + discontinuities)
+        out.append(line)
+    out.extend(carried.values())
+    out.extend(line for line in blocks[-1] if line != "#EXT-X-DISCONTINUITY")
+    out.extend(line for line in block + trailer
+               if not line.startswith("#EXT-X-PART"))
+    return "\n".join(out) + "\n"
+
+
+def read_playlist(response):
+    """The decoded body of a playlist response, or None if unusable."""
+    raw = response.read(MAX_PLAYLIST_SIZE + 1)
+    if len(raw) > MAX_PLAYLIST_SIZE:
+        return None
+    encoding = (response.getheader("Content-Encoding") or "").strip().lower()
+    try:
+        if encoding in ("gzip", "deflate"):
+            wbits = 16 + zlib.MAX_WBITS if encoding == "gzip" else zlib.MAX_WBITS
+            decoder = zlib.decompressobj(wbits)
+            raw = decoder.decompress(raw, MAX_PLAYLIST_SIZE + 1)
+            if len(raw) > MAX_PLAYLIST_SIZE or decoder.unconsumed_tail:
+                return None
+        elif encoding not in ("", "identity"):
+            return None
+        return raw.decode("utf-8")
+    except (zlib.error, UnicodeDecodeError):
+        return None
+
+
 class StreamRelay:
     """Loopback HTTP server relaying Home Assistant HLS streams.
 
@@ -786,6 +857,9 @@ class StreamRelay:
                 "prefix": hls_url.rsplit("/", 1)[0] + "/",
                 "generation": generation,
                 "last_used": now(),
+                # Until a segment has been served, playlists are cut to the
+                # live edge; afterwards the player tracks sequence numbers.
+                "playing": False,
             }
             port = self.server.server_address[1]
         return "http://127.0.0.1:%d/%s/%s" % (
@@ -814,6 +888,12 @@ class StreamRelay:
             self.server.shutdown()
             self.server.server_close()
             self.server = None
+
+    def mark_playing(self, secret):
+        with self.lock:
+            session = self.sessions.get(secret)
+            if session is not None:
+                session["playing"] = True
 
     def lookup(self, secret):
         with self.lock:
@@ -845,6 +925,24 @@ class StreamRelay:
             request.send_error(502)
             return
         try:
+            if response.status == 200 and not session["playing"] \
+                    and rest.endswith(".m3u8") and rest != "master_playlist.m3u8":
+                text = read_playlist(response)
+                if text is None:
+                    request.send_error(502)
+                    return
+                # Sent decoded either way; a playlist too short to cut stays whole.
+                body = (live_edge_playlist(text) or text).encode("utf-8")
+                request.send_response(200)
+                request.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                request.send_header("Content-Length", str(len(body)))
+                request.send_header("Cache-Control", "no-store")
+                request.end_headers()
+                request.wfile.write(body)
+                return
+            if response.status == 200 and not rest.endswith(".m3u8") \
+                    and rest != "init.mp4":
+                self.mark_playing(secret)
             declared = response.getheader("Content-Length")
             if declared and declared.isdigit() \
                     and int(declared) > MAX_STREAM_RESPONSE:

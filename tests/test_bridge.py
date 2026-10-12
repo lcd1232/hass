@@ -1226,6 +1226,80 @@ def test_compressed_playlists_keep_their_encoding():
         server.stop()
 
 
+# Home Assistant's live playlist, as served for a real camera: three 2 s
+# segments with per-segment timestamps and a start offset.
+LIVE_PLAYLIST = (
+    b"#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-INDEPENDENT-SEGMENTS\n"
+    b"#EXT-X-MAP:URI=\"init.mp4\"\n#EXT-X-TARGETDURATION:2\n"
+    b"#EXT-X-MEDIA-SEQUENCE:6\n#EXT-X-DISCONTINUITY-SEQUENCE:0\n"
+    b"#EXT-X-START:TIME-OFFSET=-3.003,PRECISE=YES\n"
+    b"#EXT-X-PROGRAM-DATE-TIME:2026-10-12T10:46:29.962Z\n#EXTINF:2.002,\n"
+    b"./segment/6.m4s\n"
+    b"#EXT-X-DISCONTINUITY\n"
+    b"#EXT-X-PROGRAM-DATE-TIME:2026-10-12T10:46:31.964Z\n#EXTINF:2.001,\n"
+    b"./segment/7.m4s\n"
+    b"#EXT-X-PROGRAM-DATE-TIME:2026-10-12T10:46:33.965Z\n#EXTINF:2.002,\n"
+    b"./segment/8.m4s\n")
+
+
+def live_stream(**fake_options):
+    files = {"master_playlist.m3u8": b"#EXTM3U\nplaylist.m3u8\n",
+             "playlist.m3u8": LIVE_PLAYLIST,
+             "init.mp4": b"init-bytes",
+             "segment/8.m4s": b"segment-8"}
+    server = FakeHA(hls_files=files, **fake_options)
+    bridge = connected_bridge(server)
+    bridge.send({"op": "stream_start", "entity_id": "camera.front"})
+    url = (stream_event(bridge, "camera.front") or {}).get("url", "")
+    return server, bridge, url
+
+
+def test_first_playlist_starts_at_the_live_edge():
+    print("stream: playback starts at the newest segment, not three back")
+    server, bridge, url = live_stream(hls_gzip=True)
+    try:
+        status, master = local_get(url)
+        check("the master playlist is untouched", status == 200, (status, master))
+        status, body = local_get(sibling(url, "playlist.m3u8"))
+        text = body.decode("utf-8", "replace")
+        check("relays the media playlist uncompressed",
+              status == 200 and text.startswith("#EXTM3U"), body[:20])
+        check("keeps only the newest segment",
+              "segment/8.m4s" in text and "segment/7.m4s" not in text
+              and "segment/6.m4s" not in text, text)
+        check("renumbers the media sequence to that segment",
+              "#EXT-X-MEDIA-SEQUENCE:8\n" in text, text)
+        check("counts the dropped discontinuity",
+              "#EXT-X-DISCONTINUITY-SEQUENCE:1\n" in text, text)
+        check("keeps the init section and target duration",
+              '#EXT-X-MAP:URI="init.mp4"' in text and "#EXT-X-TARGETDURATION:2" in text,
+              text)
+        check("keeps the kept segment's timestamp",
+              "2026-10-12T10:46:33.965Z" in text
+              and "2026-10-12T10:46:31.964Z" not in text, text)
+        check("drops the start offset that points back into removed segments",
+              "EXT-X-START" not in text, text)
+    finally:
+        bridge.stop()
+        server.stop()
+
+
+def test_playlists_pass_through_once_playing():
+    print("stream: once a segment has played, playlists are relayed whole")
+    server, bridge, url = live_stream()
+    try:
+        local_get(url)
+        local_get(sibling(url, "playlist.m3u8"))
+        status, _ = local_get(sibling(url, "segment/8.m4s"))
+        check("serves the segment", status == 200, status)
+        status, body = local_get(sibling(url, "playlist.m3u8"))
+        check("the next playlist is Home Assistant's own",
+              status == 200 and body == LIVE_PLAYLIST, body)
+    finally:
+        bridge.stop()
+        server.stop()
+
+
 def test_stream_relay_refuses_strangers():
     print("stream: the relay serves only its own secret path")
     server = FakeHA()
@@ -1399,6 +1473,8 @@ def main():
                  test_demo_camera_snapshot,
                  test_camera_stream_is_relayed_over_loopback,
                  test_compressed_playlists_keep_their_encoding,
+                 test_first_playlist_starts_at_the_live_edge,
+                 test_playlists_pass_through_once_playing,
                  test_stream_relay_refuses_strangers,
                  test_stopped_stream_is_gone,
                  test_reconfiguring_ends_streams,
